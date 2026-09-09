@@ -1,12 +1,16 @@
-import type { AddressInfo } from "node:net";
+import http, { Agent as HttpAgent } from "node:http";
+import https from "node:https";
+import net, { type AddressInfo } from "node:net";
+import type { Duplex } from "node:stream";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { describe, expect, it, vi } from "vitest";
-import { WebSocketServer } from "ws";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import WebSocket, { WebSocketServer } from "ws";
 import {
   buildRelayWebSocketOptions,
   buildRelayWebSocketUrl,
   monitorSlackRelaySource,
   parseRelayFrame,
+  resolveRelayProxyAgent,
   SlackRelayMalformedFrameError,
   SLACK_RELAY_MAX_PAYLOAD_BYTES,
   type SlackRelayIdentity,
@@ -51,7 +55,9 @@ describe("Slack relay source", () => {
       }),
     ).toThrow("must include its websocket path");
 
-    expect(buildRelayWebSocketOptions("secret")).toMatchObject({
+    expect(
+      buildRelayWebSocketOptions("secret", "wss://router.example.com/gateway/ws?gateway_id=pash"),
+    ).toMatchObject({
       headers: { Authorization: "Bearer secret" },
       maxPayload: SLACK_RELAY_MAX_PAYLOAD_BYTES,
       perMessageDeflate: false,
@@ -241,5 +247,213 @@ describe("Slack relay source", () => {
     it("parses array frames", () => {
       expect(parseRelayFrame(relayFrame("[1, 2, 3]"))).toEqual([1, 2, 3]);
     });
+  });
+});
+
+// Self-signed loopback certificate (SAN: 127.0.0.1, localhost; valid to 2126)
+// so the proxied and direct wss:// dials below terminate real TLS on 127.0.0.1.
+const RELAY_TEST_TLS_CERT = `-----BEGIN CERTIFICATE-----
+MIIBpzCCAUygAwIBAgIUezTxOxdfUphW7GSOPN3w6ppcqe0wCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQc2xhY2stcmVsYXkudGVzdDAgFw0yNjA5MDkxNzUzMzBaGA8y
+MTI2MDgxNjE3NTMzMFowGzEZMBcGA1UEAwwQc2xhY2stcmVsYXkudGVzdDBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABKYC/MK+pREkCGg+imE4JGALlFu2aVQP7XJN
+Ckezs+JewV/OAxB4RzXVcgSgGKP6USQaDBnoBBEy+34QH2zXtJ2jbDBqMB0GA1Ud
+DgQWBBSI3WK70K2Wh3wnN+TdlErOoIKmQzAfBgNVHSMEGDAWgBSI3WK70K2Wh3wn
+N+TdlErOoIKmQzAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYDVR0TBAUw
+AwEB/zAKBggqhkjOPQQDAgNJADBGAiEAphAGvWPFTevL7rEy7dBjoTVAk/oT93Mm
+qvz6jsUI73ACIQDLLDdqa0x1RevRJ98Y1vQad1mNK9Yk4Oh6k2HkafQ9tg==
+-----END CERTIFICATE-----`;
+const RELAY_TEST_TLS_KEY = [
+  "-----BEGIN PRIVATE KEY-----", // pragma: allowlist secret
+  "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgnzhEeRMhzEsaGPOM",
+  "xvBVdxlMJ7ANKKYd4P6pIl1KgpWhRANCAASmAvzCvqURJAhoPophOCRgC5RbtmlU",
+  "D+1yTQpHs7PiXsFfzgMQeEc11XIEoBij+lEkGgwZ6AQRMvt+EB9s17Sd",
+  "-----END PRIVATE KEY-----",
+].join("\n");
+
+const PROXY_ENV_KEYS = [
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "all_proxy",
+  "no_proxy",
+] as const;
+
+describe("Slack relay proxy environment", () => {
+  const relayUrl = "wss://router.example.com/gateway/ws?gateway_id=pash";
+
+  beforeEach(() => {
+    for (const key of PROXY_ENV_KEYS) {
+      vi.stubEnv(key, undefined);
+    }
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("dials directly when the environment names no proxy", () => {
+    expect(resolveRelayProxyAgent(relayUrl)).toBeUndefined();
+    const options = buildRelayWebSocketOptions("secret", relayUrl);
+    expect(options).not.toHaveProperty("agent");
+    expect(options).toMatchObject({
+      headers: { Authorization: "Bearer secret" },
+      handshakeTimeout: 30_000,
+      maxPayload: SLACK_RELAY_MAX_PAYLOAD_BYTES,
+      perMessageDeflate: false,
+    });
+  });
+
+  it("attaches an env proxy agent to a wss:// dial", () => {
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.example.internal:3128");
+    const agent = resolveRelayProxyAgent(relayUrl);
+    expect(agent).toBeInstanceOf(HttpAgent);
+    const options = buildRelayWebSocketOptions("secret", relayUrl);
+    expect(options.agent).toBeInstanceOf(HttpAgent);
+    expect(options).toMatchObject({
+      headers: { Authorization: "Bearer secret" },
+      handshakeTimeout: 30_000,
+      maxPayload: SLACK_RELAY_MAX_PAYLOAD_BYTES,
+      perMessageDeflate: false,
+    });
+  });
+
+  it("falls back to HTTP_PROXY and lowercase variants for a wss:// dial", () => {
+    vi.stubEnv("HTTP_PROXY", "http://proxy.example.internal:3128");
+    expect(resolveRelayProxyAgent(relayUrl)).toBeInstanceOf(HttpAgent);
+    vi.stubEnv("HTTP_PROXY", undefined);
+    vi.stubEnv("https_proxy", "http://proxy.example.internal:3128");
+    expect(resolveRelayProxyAgent(relayUrl)).toBeInstanceOf(HttpAgent);
+  });
+
+  it("keeps a NO_PROXY match on a direct dial", () => {
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.example.internal:3128");
+    vi.stubEnv("NO_PROXY", "localhost,.example.com");
+    expect(resolveRelayProxyAgent(relayUrl)).toBeUndefined();
+    expect(buildRelayWebSocketOptions("secret", relayUrl)).not.toHaveProperty("agent");
+    expect(resolveRelayProxyAgent("wss://router.example.net/gateway/ws")).toBeInstanceOf(HttpAgent);
+  });
+
+  it("never proxies a plaintext ws:// dial", () => {
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.example.internal:3128");
+    vi.stubEnv("HTTP_PROXY", "http://proxy.example.internal:3128");
+    const localUrl = buildRelayWebSocketUrl({
+      url: "ws://127.0.0.1:18080/gateway/ws",
+      authToken: "secret",
+      gatewayId: "pash",
+    });
+    expect(resolveRelayProxyAgent(localUrl)).toBeUndefined();
+    expect(buildRelayWebSocketOptions("secret", localUrl)).not.toHaveProperty("agent");
+  });
+
+  it("dials directly when the proxy URL uses an unsupported protocol", () => {
+    vi.stubEnv("HTTPS_PROXY", "socks5://proxy.example.internal:1080");
+    expect(resolveRelayProxyAgent(relayUrl)).toBeUndefined();
+  });
+
+  it("tunnels the relay upgrade through the env CONNECT proxy and bypasses it on NO_PROXY", async () => {
+    const sockets = new Set<Duplex>();
+    const track = (socket: Duplex) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+    };
+    const tunneledPorts = new Set<number>();
+    const upgrades: Array<{ via: "proxy" | "direct"; authorization?: string; url?: string }> = [];
+    const connects: string[] = [];
+
+    const relayHttps = https.createServer({ key: RELAY_TEST_TLS_KEY, cert: RELAY_TEST_TLS_CERT });
+    relayHttps.on("connection", track);
+    const relay = new WebSocketServer({ server: relayHttps, path: "/gateway/ws" });
+    relay.on("connection", (socket, request) => {
+      upgrades.push({
+        via: tunneledPorts.has(request.socket.remotePort ?? -1) ? "proxy" : "direct",
+        authorization: request.headers.authorization,
+        url: request.url,
+      });
+      socket.close();
+    });
+
+    const proxy = http.createServer((_request, response) => {
+      response.writeHead(403).end();
+    });
+    proxy.on("connection", track);
+    proxy.on("connect", (request, clientSocket, head) => {
+      track(clientSocket);
+      connects.push(request.url ?? "");
+      const target = new URL(`http://${request.url}`);
+      const targetSocket = net.connect(Number(target.port), target.hostname, () => {
+        tunneledPorts.add(targetSocket.localPort ?? -1);
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length > 0) {
+          targetSocket.write(head);
+        }
+        clientSocket.pipe(targetSocket);
+        targetSocket.pipe(clientSocket);
+      });
+      track(targetSocket);
+      targetSocket.on("error", () => clientSocket.destroy());
+      clientSocket.on("error", () => targetSocket.destroy());
+    });
+
+    const listen = (server: http.Server | https.Server) =>
+      new Promise<number>((resolve) => {
+        server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port));
+      });
+    const relayPort = await listen(relayHttps);
+    const proxyPort = await listen(proxy);
+    const dial = async () => {
+      const url = buildRelayWebSocketUrl({
+        url: `https://127.0.0.1:${relayPort}/gateway/ws`,
+        authToken: "secret",
+        gatewayId: "pash",
+      });
+      const options = buildRelayWebSocketOptions("secret", url);
+      const ws = new WebSocket(url, { ...options, ca: RELAY_TEST_TLS_CERT });
+      await new Promise<void>((resolve, reject) => {
+        ws.once("open", resolve);
+        ws.once("error", reject);
+      });
+      await new Promise<void>((resolve) => {
+        ws.once("close", () => resolve());
+      });
+      return options;
+    };
+
+    try {
+      vi.stubEnv("HTTPS_PROXY", `http://127.0.0.1:${proxyPort}`);
+      const proxied = await dial();
+      expect(connects).toEqual([`127.0.0.1:${relayPort}`]);
+      expect(upgrades).toEqual([
+        {
+          via: "proxy",
+          authorization: "Bearer secret",
+          url: "/gateway/ws?gateway_id=pash",
+        },
+      ]);
+      expect(proxied.agent).toBeInstanceOf(HttpAgent);
+
+      vi.stubEnv("NO_PROXY", "127.0.0.1");
+      const bypassed = await dial();
+      expect(bypassed).not.toHaveProperty("agent");
+      expect(connects).toHaveLength(1);
+      expect(upgrades).toHaveLength(2);
+      expect(upgrades[1]).toMatchObject({ via: "direct", authorization: "Bearer secret" });
+    } finally {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      await new Promise<void>((resolve) => {
+        relay.close(() => resolve());
+      });
+      await new Promise<void>((resolve) => {
+        relayHttps.close(() => resolve());
+      });
+      await new Promise<void>((resolve) => {
+        proxy.close(() => resolve());
+      });
+    }
   });
 });

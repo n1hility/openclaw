@@ -1,6 +1,8 @@
 // Slack plugin module implements relay-backed inbound event transport.
 import { Buffer } from "node:buffer";
+import type { Agent as HttpAgent } from "node:http";
 import { isIP } from "node:net";
+import { createNodeProxyAgent } from "openclaw/plugin-sdk/fetch-runtime";
 import {
   computeBackoff,
   sleepWithAbort,
@@ -104,7 +106,7 @@ function openRelayWebSocket(
   }
   return new Promise((resolve, reject) => {
     const url = buildRelayWebSocketUrl(config);
-    const ws = new WebSocket(url, buildRelayWebSocketOptions(config.authToken));
+    const ws = new WebSocket(url, buildRelayWebSocketOptions(config.authToken, url));
 
     const cleanup = () => {
       ws.off("open", onOpen);
@@ -232,8 +234,10 @@ async function handleRelayFrame(params: {
   sendRelayAck(params.ws, event.deliveryId);
 }
 
-export function buildRelayWebSocketOptions(authToken: string): ClientOptions {
+export function buildRelayWebSocketOptions(authToken: string, url: string): ClientOptions {
+  const agent = resolveRelayProxyAgent(url);
   return {
+    ...(agent ? { agent } : {}),
     headers: {
       Authorization: `Bearer ${authToken}`,
     },
@@ -241,6 +245,27 @@ export function buildRelayWebSocketOptions(authToken: string): ClientOptions {
     maxPayload: SLACK_RELAY_MAX_PAYLOAD_BYTES,
     perMessageDeflate: false,
   };
+}
+
+/**
+ * Resolve the env proxy agent for a wss:// relay dial, or undefined for a direct dial.
+ *
+ * ws always hands its own createConnection to https.request, and Node skips the
+ * global agent (the only place NODE_USE_ENV_PROXY applies) whenever a request
+ * supplies createConnection without an agent, so the proxy environment has to
+ * be attached here. A NO_PROXY match and ws:// URLs (loopback-only in relay
+ * mode) keep the direct dial.
+ */
+export function resolveRelayProxyAgent(url: string): HttpAgent | undefined {
+  if (!url.startsWith("wss:")) {
+    return undefined;
+  }
+  try {
+    return createNodeProxyAgent({ mode: "env", targetUrl: url, protocol: "https" });
+  } catch {
+    // Unsupported or malformed proxy URL; dial directly, as the Web API client does.
+    return undefined;
+  }
 }
 
 export function buildRelayWebSocketUrl(config: SlackRelaySourceConfig): string {

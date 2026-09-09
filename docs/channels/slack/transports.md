@@ -56,7 +56,7 @@ Relay mode separates Slack ingress from the OpenClaw gateway. A trusted router o
 }
 ```
 
-The relay URL must use `wss://` unless it targets localhost. Treat the bearer token and router route table as part of the Slack authorization boundary: routed events enter the normal Slack message handler as authorized activations. A router-provided `slack_identity` in the websocket `hello` frame can set the default outbound username and icon; an explicit identity supplied by the caller still wins. The relay connection reconnects with the same bounded backoff timing as Socket Mode and clears the router-provided identity whenever it disconnects.
+The relay URL must use `wss://` unless it targets localhost. Treat the bearer token and router route table as part of the Slack authorization boundary: routed events enter the normal Slack message handler as authorized activations. A router-provided `slack_identity` in the websocket `hello` frame can set the default outbound username and icon; an explicit identity supplied by the caller still wins. The relay connection reconnects with the same bounded backoff timing as Socket Mode and clears the router-provided identity whenever it disconnects. The relay websocket honors the gateway host's standard proxy environment (`HTTPS_PROXY`, `HTTP_PROXY`, lowercase variants, `NO_PROXY`): a `wss://` relay URL is dialed through the configured proxy with an HTTP `CONNECT` tunnel, and a `NO_PROXY` match or a localhost `ws://` URL connects directly.
 
 ## Socket Mode transport tuning
 
