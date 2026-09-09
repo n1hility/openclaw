@@ -452,6 +452,7 @@ async function dispatchNativeProgressScenario(params: {
     render?: "rich";
     toolProgress?: boolean;
     commandText?: "raw" | "status";
+    reasoning?: "narration" | "cards";
   };
   replyToMode?: "off" | "first" | "all" | "batched";
   eventScope?: {
@@ -3596,6 +3597,271 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       planUpdate("Working"),
     ]);
     expectNativeStreamText(`\n${FINAL_REPLY_TEXT}`);
+  });
+
+  it("keeps the narration presentation unchanged when progress.reasoning is narration", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "narration" },
+      events: [
+        { kind: "reasoning", text: "Checking", isReasoningSnapshot: true },
+        {
+          kind: "reasoning",
+          text: "Checking the Slack handler",
+          isReasoningSnapshot: true,
+        },
+      ],
+    });
+
+    expect(collectNativeTaskUpdates()).toEqual([]);
+    expectNativeStreamText("Checking");
+    expectNativeProgressAppend(0, [
+      { type: "markdown_text", text: " the Slack handler" },
+      planUpdate("Working"),
+    ]);
+    expectNativeStreamText(`\n${FINAL_REPLY_TEXT}`);
+  });
+
+  it("renders streamed reasoning as segment task cards instead of narration", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "cards" },
+      events: [
+        { kind: "reasoning", text: "Checking", isReasoningSnapshot: true },
+        { kind: "reasoning", text: "Checking the Slack handler", isReasoningSnapshot: true },
+        { kind: "reasoning_end" },
+      ],
+    });
+
+    const reasoningCardId = expect.stringMatching(/^reasoning_1_[a-f0-9]{8}$/u);
+    expectNativeProgressStart([
+      planUpdate("Thinking"),
+      taskUpdate(reasoningCardId, "🧠 Checking", "in_progress"),
+    ]);
+    // The second snapshot arrives inside the throttle window and rides the
+    // completion append, sealed by the end of the reasoning phase.
+    expectNativeProgressAppend(0, [
+      planUpdate(expect.stringMatching(/^Thought for \d+s$/u)),
+      taskUpdate(reasoningCardId, "🧠 Checking the Slack handler", "complete"),
+    ]);
+    expectNativeStreamText("Checking", 0);
+    expectNativeStreamText(`\n${FINAL_REPLY_TEXT}`);
+    const streamTexts = [...startSlackStreamMock.mock.calls, ...appendSlackStreamMock.mock.calls]
+      .map((call) => requireRecord(call[0], "native stream call").text)
+      .filter((text): text is string => typeof text === "string");
+    expect(streamTexts.join("")).not.toContain("Checking");
+  });
+
+  it("merges reasoning deltas, prefix extensions, and flagged snapshots into one card", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "cards" },
+      events: [
+        { kind: "reasoning", text: "Reading" },
+        { kind: "reasoning", text: " the handler" },
+        { kind: "reasoning", text: "Reading the handler now" },
+        { kind: "reasoning", text: "<think>Fresh snapshot</think>", isReasoningSnapshot: true },
+      ],
+    });
+
+    const reasoningCardId = expect.stringMatching(/^reasoning_1_[a-f0-9]{8}$/u);
+    expect(collectNativeTaskUpdates()).toEqual([
+      taskUpdate(reasoningCardId, "🧠 Reading", "in_progress"),
+      taskUpdate(reasoningCardId, "🧠 Fresh snapshot", "complete"),
+    ]);
+  });
+
+  it.each([
+    { split: "a trailing space", deltas: ["Reading ", "the handler"], text: "Reading the handler" },
+    {
+      split: "a wrapper tag closed by a later delta",
+      deltas: ["<think>Fresh", " snapshot</think>"],
+      text: "Fresh snapshot",
+    },
+  ])("keeps the raw reasoning across deltas split at $split", async ({ deltas, text }) => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "cards" },
+      events: [
+        ...deltas.map((delta) => ({ kind: "reasoning" as const, text: delta })),
+        { kind: "reasoning_end" },
+      ],
+    });
+
+    const tasks = collectNativeTaskUpdates();
+    expect(new Set(tasks.map((task) => task.id)).size).toBe(1);
+    expect(tasks.at(-1)).toEqual(
+      taskUpdate(expect.stringMatching(/^reasoning_1_[a-f0-9]{8}$/u), `🧠 ${text}`, "complete"),
+    );
+  });
+
+  it("seals the open reasoning card at a tool boundary so later thinking starts a new card", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "cards" },
+      events: [
+        { kind: "reasoning", text: "Plan the fix." },
+        {
+          kind: "tool_start",
+          itemId: "tool-1",
+          name: "bash",
+          phase: "start",
+          args: { command: "pnpm test" },
+        },
+        { kind: "reasoning", text: "Tests pass, now summarize." },
+        { kind: "reasoning_end" },
+      ],
+    });
+
+    const tasks = collectNativeTaskUpdates();
+    expect(tasks).toEqual([
+      taskUpdate(
+        expect.stringMatching(/^reasoning_1_[a-f0-9]{8}$/u),
+        "🧠 Plan the fix.",
+        "in_progress",
+      ),
+      taskUpdate(
+        expect.stringMatching(/^reasoning_1_[a-f0-9]{8}$/u),
+        "🧠 Plan the fix.",
+        "complete",
+      ),
+      taskUpdate(expect.stringMatching(/^tool_1_[a-f0-9]{8}$/u), "🛠️ Bash", "complete"),
+      taskUpdate(
+        expect.stringMatching(/^reasoning_2_[a-f0-9]{8}$/u),
+        "🧠 Tests pass, now summarize.",
+        "complete",
+      ),
+    ]);
+    const completion = requireRecord(
+      requireMockCall(appendSlackStreamMock, 0, "completion append")[0],
+      "completion append",
+    );
+    expect((completion.chunks as unknown[])[0]).toEqual(
+      planUpdate(expect.stringMatching(/^Thought for \d+s, 1 tool call$/u)),
+    );
+  });
+
+  it("keeps an explicit progress title through reasoning card completion", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "cards", label: "Shelling" },
+      events: [{ kind: "reasoning", text: "Checking the handler" }, { kind: "reasoning_end" }],
+    });
+
+    const plans = [...startSlackStreamMock.mock.calls, ...appendSlackStreamMock.mock.calls]
+      .flatMap((call) => {
+        const chunks = requireRecord(call[0], "native stream call").chunks;
+        return Array.isArray(chunks) ? chunks : [];
+      })
+      .filter((chunk) => requireRecord(chunk, "chunk").type === "plan_update");
+    expect(plans).toEqual([planUpdate("Shelling")]);
+  });
+
+  it("keeps reasoning in narration on the quiet card even when cards are configured", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { style: "card", toolProgress: false, nativeTaskCards: true, reasoning: "cards" },
+      events: [
+        { kind: "reasoning", text: "Checking", isReasoningSnapshot: true },
+        { kind: "reasoning", text: "Checking the Slack handler", isReasoningSnapshot: true },
+      ],
+    });
+
+    expect(
+      collectNativeTaskUpdates().filter(
+        (task) => typeof task.id === "string" && task.id.startsWith("reasoning_"),
+      ),
+    ).toEqual([]);
+    expectNativeStreamText("Checking");
+  });
+
+  it("caps a long think at the plan-block budget and rolls the rest through a tail card", async () => {
+    vi.useFakeTimers();
+    // 50 single-card segments: each is 240 characters with no space, numbered.
+    const segments = Array.from({ length: 50 }, (_, index) => `s${index + 1}`.padEnd(240, "x"));
+    const snapshotUpTo = (count: number) => ({
+      kind: "reasoning" as const,
+      text: segments.slice(0, count).join(" "),
+      isReasoningSnapshot: true,
+    });
+    const postToolSnapshotUpTo = (count: number) => ({
+      kind: "reasoning" as const,
+      text: segments.slice(20, count).join(" "),
+      isReasoningSnapshot: true,
+    });
+    const settle = { kind: "checkpoint" as const, run: () => vi.advanceTimersByTimeAsync(1_000) };
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      progress: { nativeTaskCards: true, reasoning: "cards" },
+      events: [
+        snapshotUpTo(10),
+        settle,
+        snapshotUpTo(20),
+        settle,
+        {
+          kind: "tool_start",
+          itemId: "tool-1",
+          name: "bash",
+          phase: "start",
+          args: { command: "pnpm test" },
+        },
+        settle,
+        postToolSnapshotUpTo(30),
+        settle,
+        postToolSnapshotUpTo(40),
+        settle,
+        postToolSnapshotUpTo(50),
+        settle,
+        { kind: "reasoning_end" },
+        settle,
+      ],
+    });
+
+    const tasks = collectNativeTaskUpdates();
+    const reasoningTasks = tasks.filter(
+      (task) => typeof task.id === "string" && task.id.startsWith("reasoning_"),
+    );
+    const ids = [...new Set(reasoningTasks.map((task) => task.id as string))];
+    // One tool call reserves a row: 47 - 1 = 46 segment cards, then the tail.
+    expect(ids).toHaveLength(47);
+    expect(ids.slice(0, 46)).toEqual(
+      Array.from({ length: 46 }, (_, index) =>
+        expect.stringMatching(new RegExp(`^reasoning_${index + 1}_[a-f0-9]{8}$`, "u")),
+      ),
+    );
+    expect(ids[46]).toEqual(expect.stringMatching(/^reasoning_tail_[a-f0-9]{8}$/u));
+    for (const task of reasoningTasks) {
+      expect((task.title as string).length).toBeLessThanOrEqual(250);
+    }
+    // Cards sealed by the tool call carry pre-tool text only; later cards carry post-tool text only.
+    for (const task of reasoningTasks) {
+      const id = task.id as string;
+      const title = task.title as string;
+      const match = /^reasoning_(\d+)_/u.exec(id);
+      if (!match) {
+        continue;
+      }
+      const index = Number(match[1]);
+      const segmentNumber = Number(/^🧠 s(\d+)x/u.exec(title)?.[1]);
+      expect(segmentNumber).toBe(index);
+      expect(segmentNumber <= 20).toBe(index <= 20);
+    }
+    const tail = reasoningTasks.filter((task) => (task.id as string).startsWith("reasoning_tail_"));
+    expect(tail.at(-1)?.title).toBe(`🧠 …${segments[49]?.slice(1)}`);
+    expect(tail.at(-1)?.status).toBe("complete");
+    // No identical chunk is sent twice.
+    const serialized = tasks.map((task) => JSON.stringify(task));
+    expect(new Set(serialized).size).toBe(serialized.length);
+    expect(tasks.some((task) => (task.id as string).startsWith("tool_1_"))).toBe(true);
+    const planTitles = [...startSlackStreamMock.mock.calls, ...appendSlackStreamMock.mock.calls]
+      .flatMap((call) => {
+        const chunks = requireRecord(call[0], "native stream call").chunks;
+        return Array.isArray(chunks) ? chunks : [];
+      })
+      .filter((chunk) => requireRecord(chunk, "chunk").type === "plan_update")
+      .map((chunk) => requireRecord(chunk, "chunk").title);
+    expect(planTitles.at(-1)).toBe("Thought for 7s, 1 tool call");
+    expect(planTitles).not.toContainEqual(expect.stringContaining("🧠"));
   });
 
   it("keeps final fallback in the planned thread when native Slack progress start fails", async () => {
