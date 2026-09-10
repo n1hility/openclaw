@@ -2,10 +2,10 @@ import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import net, { type AddressInfo } from "node:net";
-import os from "node:os";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import tls from "node:tls";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
@@ -580,6 +580,7 @@ function startRelayMonitor(
 }
 
 describe("Slack relay proxy environment", () => {
+  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   let originalCertificates: string[];
 
   beforeEach(() => {
@@ -746,8 +747,9 @@ describe("Slack relay proxy environment", () => {
       ]);
       expect(monitor.acceptRelayEvent).toHaveBeenCalledTimes(1);
     } finally {
-      expect(await monitor.stop()).toBeUndefined();
+      const stopped = await monitor.stop();
       await fixture.close();
+      expect(stopped).toBeUndefined();
     }
   });
 
@@ -787,8 +789,9 @@ describe("Slack relay proxy environment", () => {
         expect(fixture.upgrades).toEqual([]);
         expect(monitor.acceptRelayEvent).not.toHaveBeenCalled();
       } finally {
-        expect(await monitor.stop()).toMatchObject({ name: "AbortError" });
+        const stopped = await monitor.stop();
         await fixture.close();
+        expect(stopped).toMatchObject({ name: "AbortError" });
       }
     },
   );
@@ -810,14 +813,15 @@ describe("Slack relay proxy environment", () => {
         { via: "direct", authorization: "Bearer relay-secret", url: "/gateway/ws?gateway_id=pash" },
       ]);
     } finally {
-      expect(await monitor.stop()).toBeUndefined();
+      const stopped = await monitor.stop();
       await fixture.close();
+      expect(stopped).toBeUndefined();
     }
   });
 
   it("dials an https:// proxy over TLS trusted through the managed-proxy CA file", async () => {
     const fixture = await createRelayGatedProxyFixture({ tls: true });
-    const caDir = fs.mkdtempSync(path.join(os.tmpdir(), "slack-relay-proxy-ca-"));
+    const caDir = tempDirs.make("slack-relay-proxy-ca-");
     const caFile = path.join(caDir, "proxy-ca.pem");
     fs.writeFileSync(caFile, PROXY_TEST_TLS_CERT, "utf8");
     vi.stubEnv("HTTPS_PROXY", `https://${fixture.proxyHost}`);
@@ -835,9 +839,9 @@ describe("Slack relay proxy environment", () => {
         { via: "proxy", authorization: "Bearer relay-secret", url: "/gateway/ws?gateway_id=pash" },
       ]);
     } finally {
-      expect(await monitor.stop()).toBeUndefined();
+      const stopped = await monitor.stop();
       await fixture.close();
-      fs.rmSync(caDir, { recursive: true, force: true });
+      expect(stopped).toBeUndefined();
     }
   });
 
@@ -860,8 +864,9 @@ describe("Slack relay proxy environment", () => {
       expect(fixture.relayConnections()).toBe(0);
       expect(fixture.upgrades).toEqual([]);
     } finally {
-      expect(await monitor.stop()).toMatchObject({ name: "AbortError" });
+      const stopped = await monitor.stop();
       await fixture.close();
+      expect(stopped).toMatchObject({ name: "AbortError" });
     }
   });
 });
