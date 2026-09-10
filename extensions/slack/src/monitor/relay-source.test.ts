@@ -3,6 +3,7 @@ import https from "node:https";
 import net, { type AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import tls from "node:tls";
+import { rawDataToString } from "openclaw/plugin-sdk/webhook-ingress";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import {
@@ -411,7 +412,7 @@ describe("Slack relay proxy environment", () => {
       });
       fixture.relay.once("connection", (socket) => {
         socket.on("message", (data) => {
-          const frame: unknown = JSON.parse(data.toString());
+          const frame: unknown = JSON.parse(rawDataToString(data));
           receivedAcks.push(frame);
           ack.resolve(frame);
         });
