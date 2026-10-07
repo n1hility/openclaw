@@ -494,6 +494,7 @@ async function dispatchSlackMessageWithSetup(
             }
           : undefined,
         onReasoningEnd: async () => {
+          await progress.sealReasoningCards();
           await progress.onDraftBoundary?.();
           return false;
         },
@@ -509,6 +510,11 @@ async function dispatchSlackMessageWithSetup(
         onToolStart: async (payload) => {
           if (statusReactionsEnabled) {
             await statusReactions.setTool(payload.name);
+          }
+          if (payload.phase === "start") {
+            // Seal before the tool row is admitted so thinking after the
+            // result starts a new card below it.
+            await progress.noteReasoningToolCall();
           }
           return await progress.progressDraft.pushToolEvent(payload);
         },
@@ -569,6 +575,7 @@ async function dispatchSlackMessageWithSetup(
     }
   }
 
+  await progress.drainNativeProgressBeforeClose();
   const completionChunks =
     progress.useNativeProgressStreaming && !progress.nativeProgressCompletionSent
       ? progress.buildNativeProgressCompletionChunks(

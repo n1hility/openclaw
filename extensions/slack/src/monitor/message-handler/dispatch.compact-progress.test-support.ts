@@ -58,7 +58,7 @@ export type SlackReplyOptionEvent =
   | { kind: "assistant_start" }
   | { kind: "reasoning"; text?: string; isReasoningSnapshot?: boolean }
   | { kind: "reasoning_end" }
-  | { kind: "checkpoint"; run: () => Promise<void> }
+  | { kind: "checkpoint"; run: () => Promise<unknown> }
   | ({ kind: "approval" } & Parameters<NonNullable<GetReplyOptions["onApprovalEvent"]>>[0]);
 
 /** A model preamble stays visible while successful and failed work continues. */

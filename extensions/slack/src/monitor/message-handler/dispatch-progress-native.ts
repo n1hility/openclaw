@@ -36,8 +36,14 @@ export function createSlackNativeProgressTransport(params: {
     return !delivery.streamFailed;
   };
 
-  const start = async (update: { text?: string; chunks?: AnyChunk[] }): Promise<boolean> => {
-    const streamThreadTs = replyPlan.nextThreadTs();
+  const start = async (
+    update: { text?: string; chunks?: AnyChunk[] },
+    options?: {
+      /** Continue an existing chain in its thread instead of taking the next reply slot. */
+      threadTs?: string;
+    },
+  ): Promise<boolean> => {
+    const streamThreadTs = options?.threadTs ?? replyPlan.nextThreadTs();
     if (!streamThreadTs) {
       logVerbose(
         "slack-stream: no reply thread target for native progress stream start, falling back",
@@ -69,6 +75,8 @@ export function createSlackNativeProgressTransport(params: {
     if (!session) {
       return false;
     }
+    // Account before the call: Slack may hold the content even when the response is lost.
+    delivery.streamLedger.record(update);
     await appendSlackStream({
       session,
       ...(update.text ? { text: update.text } : {}),
